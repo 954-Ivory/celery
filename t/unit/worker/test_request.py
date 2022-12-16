@@ -26,7 +26,7 @@ from celery.worker.state import revoked
 
 class RequestCase:
 
-    def setup(self):
+    def setup_method(self):
         self.app.conf.result_serializer = 'pickle'
 
         @self.app.task(shared=False)
@@ -385,7 +385,7 @@ class test_Request(RequestCase):
             task_failure,
             sender=req.task,
             task_id=req.id,
-            exception=einfo.exception,
+            exception=einfo.exception.exc,
             args=req.args,
             kwargs=req.kwargs,
             traceback=einfo.traceback,
@@ -394,7 +394,7 @@ class test_Request(RequestCase):
             req.on_failure(einfo)
 
         req.task.backend.mark_as_failure.assert_called_once_with(req.id,
-                                                                 einfo.exception,
+                                                                 einfo.exception.exc,
                                                                  request=req._context,
                                                                  store_result=True)
 
@@ -807,7 +807,7 @@ class test_Request(RequestCase):
         m = self.TaskMessage(self.mytask.name, args=(), kwargs='foo')
         req = Request(m, app=self.app)
         with pytest.raises(InvalidTaskError):
-            raise req.execute().exception
+            raise req.execute().exception.exc
 
     def test_on_hard_timeout_acks_late(self, patching):
         error = patching('celery.worker.request.error')
@@ -1173,11 +1173,11 @@ class test_Request(RequestCase):
 
 class test_create_request_class(RequestCase):
 
-    def setup(self):
+    def setup_method(self):
         self.task = Mock(name='task')
         self.pool = Mock(name='pool')
         self.eventer = Mock(name='eventer')
-        super().setup()
+        super().setup_method()
 
     def create_request_cls(self, **kwargs):
         return create_request_cls(

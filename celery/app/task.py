@@ -1,7 +1,7 @@
 """Task implementation: request context and the task base class."""
 import sys
 
-from billiard.einfo import ExceptionInfo
+from billiard.einfo import ExceptionInfo, ExceptionWithTraceback
 from kombu import serialization
 from kombu.exceptions import OperationalError
 from kombu.utils.uuid import uuid
@@ -252,7 +252,7 @@ class Task:
     track_started = None
 
     #: When enabled messages for this task will be acknowledged **after**
-    #: the task has been executed, and not *just before* (the
+    #: the task has been executed, and not *right before* (the
     #: default behavior).
     #:
     #: Please note that this means the task may be executed twice if the
@@ -813,6 +813,8 @@ class Task:
         retval = ret.retval
         if isinstance(retval, ExceptionInfo):
             retval, tb = retval.exception, retval.traceback
+            if isinstance(retval, ExceptionWithTraceback):
+                retval = retval.exc
         if isinstance(retval, Retry) and retval.sig is not None:
             return retval.sig.apply(retries=retries + 1)
         state = states.SUCCESS if ret.info is None else ret.info.state
@@ -951,17 +953,20 @@ class Task:
         for t in reversed(self.request.chain or []):
             sig |= signature(t, app=self.app)
         # Stamping sig with parents groups
-        stamped_headers = self.request.stamped_headers
         if self.request.stamps:
             groups = self.request.stamps.get("groups")
-            sig.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+            sig.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=self.request.stamped_headers))
+            stamped_headers = self.request.stamped_headers.copy()
+            stamps = self.request.stamps.copy()
+            stamped_headers.extend(sig.options.get('stamped_headers', []))
+            stamps.update({
+                stamp: value
+                for stamp, value in sig.options.items() if stamp in sig.options.get('stamped_headers', [])
+            })
+            sig.options['stamped_headers'] = stamped_headers
+            sig.options.update(stamps)
 
-        # Finally, either apply or delay the new signature!
-        if self.request.is_eager:
-            return sig.apply().get()
-        else:
-            sig.delay()
-            raise Ignore('Replaced by new task')
+        return self.on_replace(sig)
 
     def add_to_chord(self, sig, lazy=False):
         """Add signature to the chord the current task is a member of.
@@ -1076,6 +1081,24 @@ class Task:
         Returns:
             None: The return value of this handler is ignored.
         """
+
+    def on_replace(self, sig):
+        """Handler called when the task is replaced.
+
+        Must return super().on_replace(sig) when overriding to ensure the task replacement
+        is properly handled.
+
+        .. versionadded:: 5.3
+
+        Arguments:
+            sig (Signature): signature to replace with.
+        """
+        # Finally, either apply or delay the new signature!
+        if self.request.is_eager:
+            return sig.apply().get()
+        else:
+            sig.delay()
+            raise Ignore('Replaced by new task')
 
     def add_trail(self, result):
         if self.trail:

@@ -31,7 +31,7 @@ from celery.utils.objects import Bunch
 from celery.utils.text import truncate
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
-from celery.worker.state import active_requests, maybe_shutdown, reserved_requests, task_reserved
+from celery.worker.state import active_requests, maybe_shutdown, requests, reserved_requests, task_reserved
 
 __all__ = ('Consumer', 'Evloop', 'dump_body')
 
@@ -124,7 +124,7 @@ on connection loss cancels all currently executed tasks with late acknowledgemen
 These tasks cannot be acknowledged as the connection is gone, and the tasks are automatically redelivered back to the queue.
 You can enable this behavior using the worker_cancel_long_running_tasks_on_connection_loss setting.
 In Celery 5.1 it is set to False by default. The setting will be set to True by default in Celery 6.0.
-"""  # noqa: E501
+"""
 
 
 def dump_body(m, body):
@@ -328,9 +328,13 @@ class Consumer:
                     crit('Frequent restarts detected: %r', exc, exc_info=1)
                     sleep(1)
             self.restart_count += 1
+            if self.app.conf.broker_channel_error_retry:
+                recoverable_errors = (self.connection_errors + self.channel_errors)
+            else:
+                recoverable_errors = self.connection_errors
             try:
                 blueprint.start(self)
-            except self.connection_errors as exc:
+            except recoverable_errors as exc:
                 # If we're not retrying connections, we need to properly shutdown or terminate
                 # the Celery main process instead of abruptly aborting the process without any cleanup.
                 is_connection_loss_on_startup = self.restart_count == 0
@@ -444,6 +448,9 @@ class Consumer:
         for bucket in self.task_buckets.values():
             if bucket:
                 bucket.clear_pending()
+        for request_id in reserved_requests:
+            if request_id in requests:
+                del requests[request_id]
         reserved_requests.clear()
         if self.pool and self.pool.flush:
             self.pool.flush()

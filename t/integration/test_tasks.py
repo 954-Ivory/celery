@@ -1,10 +1,13 @@
 from datetime import datetime, timedelta
 from time import perf_counter, sleep
+from uuid import uuid4
 
 import pytest
 
 import celery
-from celery import group
+from celery import chain, chord, group
+from celery.canvas import StampingVisitor
+from celery.worker import state as worker_state
 
 from .conftest import get_active_redis_channels
 from .tasks import (ClassBasedAutoRetryTask, ExpectedException, add, add_ignore_result, add_not_typed, fail,
@@ -195,6 +198,109 @@ class test_tasks:
         assert result.failed() is False
         assert result.successful() is False
 
+    def test_revoked_by_headers_simple_canvas(self, manager):
+        """Testing revoking of task using a stamped header"""
+        # Try to purge the queue before we start
+        # to attempt to avoid interference from other tests
+        while True:
+            count = manager.app.control.purge()
+            if count == 0:
+                break
+
+        target_monitoring_id = uuid4().hex
+
+        class MonitoringIdStampingVisitor(StampingVisitor):
+            def on_signature(self, sig, **headers) -> dict:
+                return {'monitoring_id': target_monitoring_id}
+
+        for monitoring_id in [target_monitoring_id, uuid4().hex, 4242, None]:
+            stamped_task = add.si(1, 1)
+            stamped_task.stamp(visitor=MonitoringIdStampingVisitor())
+            result = stamped_task.freeze()
+            result.revoke_by_stamped_headers(headers={'monitoring_id': [monitoring_id]})
+            stamped_task.apply_async()
+            if monitoring_id == target_monitoring_id:
+                with pytest.raises(celery.exceptions.TaskRevokedError):
+                    result.get()
+                assert result.status == 'REVOKED'
+                assert result.ready() is True
+                assert result.failed() is False
+                assert result.successful() is False
+            else:
+                assert result.get() == 2
+                assert result.status == 'SUCCESS'
+                assert result.ready() is True
+                assert result.failed() is False
+                assert result.successful() is True
+        worker_state.revoked_headers.clear()
+
+        # Try to purge the queue after we're done
+        # to attempt to avoid interference to other tests
+        while True:
+            count = manager.app.control.purge()
+            if count == 0:
+                break
+
+    def test_revoked_by_headers_complex_canvas(self, manager, subtests):
+        """Testing revoking of task using a stamped header"""
+        try:
+            manager.app.backend.ensure_chords_allowed()
+        except NotImplementedError as e:
+            raise pytest.skip(e.args[0])
+
+        for monitoring_id in ["4242", [1234, uuid4().hex]]:
+
+            # Try to purge the queue before we start
+            # to attempt to avoid interference from other tests
+            while True:
+                count = manager.app.control.purge()
+                if count == 0:
+                    break
+
+            target_monitoring_id = isinstance(monitoring_id, list) and monitoring_id[0] or monitoring_id
+
+            class MonitoringIdStampingVisitor(StampingVisitor):
+                def on_signature(self, sig, **headers) -> dict:
+                    return {'monitoring_id': target_monitoring_id, 'stamped_headers': ['monitoring_id']}
+
+            stamped_task = sleeping.si(4)
+            stamped_task.stamp(visitor=MonitoringIdStampingVisitor())
+            result = stamped_task.freeze()
+
+            canvas = [
+                group([stamped_task]),
+                chord(group([stamped_task]), sleeping.si(2)),
+                chord(group([sleeping.si(2)]), stamped_task),
+                chain(stamped_task),
+                group([sleeping.si(2), stamped_task, sleeping.si(2)]),
+                chord([sleeping.si(2), stamped_task], sleeping.si(2)),
+                chord([sleeping.si(2), sleeping.si(2)], stamped_task),
+                chain(sleeping.si(2), stamped_task),
+                chain(sleeping.si(2), group([sleeping.si(2), stamped_task, sleeping.si(2)])),
+                chain(sleeping.si(2), group([sleeping.si(2), stamped_task]), sleeping.si(2)),
+                chain(sleeping.si(2), group([sleeping.si(2), sleeping.si(2)]), stamped_task),
+            ]
+
+            result.revoke_by_stamped_headers(headers={'monitoring_id': monitoring_id})
+
+            for sig in canvas:
+                sig_result = sig.apply_async()
+                with subtests.test(msg='Testing if task was revoked'):
+                    with pytest.raises(celery.exceptions.TaskRevokedError):
+                        sig_result.get()
+                    assert result.status == 'REVOKED'
+                    assert result.ready() is True
+                    assert result.failed() is False
+                    assert result.successful() is False
+            worker_state.revoked_headers.clear()
+
+        # Try to purge the queue after we're done
+        # to attempt to avoid interference to other tests
+        while True:
+            count = manager.app.control.purge()
+            if count == 0:
+                break
+
     @flaky
     def test_wrong_arguments(self, manager):
         """Tests that proper exceptions are raised when task is called with wrong arguments."""
@@ -288,29 +394,43 @@ class test_tasks:
         assert res.get(timeout=TIMEOUT)["app_id"] == "1234"
 
 
-class tests_task_redis_result_backend:
-    def setup(self, manager):
+class test_task_redis_result_backend:
+    @pytest.fixture()
+    def manager(self, manager):
         if not manager.app.conf.result_backend.startswith('redis'):
             raise pytest.skip('Requires redis result backend.')
 
-    def test_ignoring_result_no_subscriptions(self):
-        assert get_active_redis_channels() == []
+        return manager
+
+    def test_ignoring_result_no_subscriptions(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add_ignore_result.delay(1, 2)
         assert result.ignored is True
-        assert get_active_redis_channels() == []
 
-    def test_asyncresult_forget_cancels_subscription(self):
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []
+
+    def test_asyncresult_forget_cancels_subscription(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add.delay(1, 2)
-        assert get_active_redis_channels() == [
-            f"celery-task-meta-{result.id}"
-        ]
+        assert set(get_active_redis_channels()) == {
+            f"celery-task-meta-{result.id}".encode(), *channels_before_test
+        }
         result.forget()
-        assert get_active_redis_channels() == []
 
-    def test_asyncresult_get_cancels_subscription(self):
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []
+
+    def test_asyncresult_get_cancels_subscription(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add.delay(1, 2)
-        assert get_active_redis_channels() == [
-            f"celery-task-meta-{result.id}"
-        ]
+        assert set(get_active_redis_channels()) == {
+            f"celery-task-meta-{result.id}".encode(), *channels_before_test
+        }
         assert result.get(timeout=3) == 3
-        assert get_active_redis_channels() == []
+
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []

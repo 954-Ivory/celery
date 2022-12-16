@@ -151,6 +151,7 @@ have been moved into a new  ``task_`` prefix.
 ``CELERY_TASK_TRACK_STARTED``              :setting:`task_track_started`
 ``CELERY_TASK_REJECT_ON_WORKER_LOST``      :setting:`task_reject_on_worker_lost`
 ``CELERYD_TIME_LIMIT``                     :setting:`task_time_limit`
+``CELERY_ALLOW_ERROR_CB_ON_CHORD_HEADER``  :setting:`task_allow_error_cb_on_chord_header`
 ``CELERYD_AGENT``                          :setting:`worker_agent`
 ``CELERYD_AUTOSCALER``                     :setting:`worker_autoscaler`
 ``CELERYD_CONCURRENCY``                    :setting:`worker_concurrency`
@@ -511,6 +512,57 @@ Default: No time limit.
 Task hard time limit in seconds. The worker processing the task will
 be killed and replaced with a new one when this is exceeded.
 
+.. setting:: task_allow_error_cb_on_chord_header
+
+``task_allow_error_cb_on_chord_header``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.3
+
+Default: Disabled.
+
+Enabling this flag will allow linking an error callback to a chord header,
+which by default will not link when using :code:`link_error()`, and preventing
+from the chord's body to execute if any of the tasks in the header fails.
+
+Consider the following canvas with the flag disabled (default behavior):
+
+.. code-block:: python
+
+    header = group([t1, t2])
+    body = t3
+    c = chord(header, body)
+    c.link_error(error_callback_sig)
+
+If *any* of the header tasks failed (:code:`t1` or :code:`t2`), by default, the chord body (:code:`t3`) would **not execute**, and :code:`error_callback_sig` will be called **once** (for the body).
+
+Enabling this flag will change the above behavior by:
+
+1. :code:`error_callback_sig` will be linked to :code:`t1` and :code:`t2` (as well as :code:`t3`).
+2. If *any* of the header tasks failed, :code:`error_callback_sig` will be called **for each** failed header task **and** the :code:`body` (even if the body didn't run).
+
+Consider now the following canvas with the flag enabled:
+
+.. code-block:: python
+
+    header = group([failingT1, failingT2])
+    body = t3
+    c = chord(header, body)
+    c.link_error(error_callback_sig)
+
+If *all* of the header tasks failed (:code:`failingT1` and :code:`failingT2`), then the chord body (:code:`t3`) would **not execute**, and :code:`error_callback_sig` will be called **3 times** (two times for the header and one time for the body).
+
+Lastly, consider the following canvas with the flag enabled:
+
+.. code-block:: python
+
+    header = group([failingT1, failingT2])
+    body = t3
+    upgraded_chord = chain(header, body)
+    upgraded_chord.link_error(error_callback_sig)
+
+This canvas will behave exactly the same as the previous one, since the :code:`chain` will be upgraded to a :code:`chord` internally.
+
 .. setting:: task_soft_time_limit
 
 ``task_soft_time_limit``
@@ -543,7 +595,7 @@ clean up before the hard time limit comes:
 Default: Disabled.
 
 Late ack means the task messages will be acknowledged **after** the task
-has been executed, not *just before* (the default behavior).
+has been executed, not *right before* (the default behavior).
 
 .. seealso::
 
@@ -2646,12 +2698,14 @@ certificate authority:
       'cert_reqs': ssl.CERT_REQUIRED
     }
 
-.. warning::
+.. versionadded:: 5.1
 
-    Be careful using ``broker_use_ssl=True``. It's possible that your default
-    configuration won't validate the server cert at all. Please read Python
-    `ssl module security
-    considerations <https://docs.python.org/3/library/ssl.html#ssl-security>`_.
+    Starting from Celery 5.1, py-amqp will always validate certificates received from the server
+    and it is no longer required to manually set ``cert_reqs`` to ``ssl.CERT_REQUIRED``.
+
+    The previous default, ``ssl.CERT_NONE`` is insecure and we its usage should be discouraged.
+    If you'd like to revert to the previous insecure default set ``cert_reqs`` to ``ssl.CERT_NONE``
+
 
 ``redis``
 _________
@@ -2751,6 +2805,19 @@ Maximum number of retries before we give up re-establishing a connection
 to the AMQP broker.
 
 If this is set to :const:`0` or :const:`None`, we'll retry forever.
+
+``broker_channel_error_retry``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.3
+
+Default: Disabled.
+
+Automatically try to re-establish the connection to the AMQP broker
+if any invalid response has been returned.
+
+The retry count and interval is the same as that of `broker_connection_retry`.
+Also, this option doesn't work when `broker_connection_retry` is `False`.
 
 .. setting:: broker_login_method
 
@@ -3441,3 +3508,16 @@ changes to the schedule into account.
 Also when running Celery beat embedded (:option:`-B <celery worker -B>`)
 on Jython as a thread the max interval is overridden and set to 1 so
 that it's possible to shut down in a timely manner.
+
+.. setting:: beat_cron_starting_deadline
+
+``beat_cron_starting_deadline``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.3
+
+Default: None.
+
+When using cron, the number of seconds :mod:`~celery.bin.beat` can look back
+when deciding whether a cron schedule is due. When set to `None`, cronjobs that
+are past due will always run immediately.

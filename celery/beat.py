@@ -46,7 +46,7 @@ class SchedulingError(Exception):
 
 
 class BeatLazyFunc:
-    """An lazy function declared in 'beat_schedule' and called before sending to worker.
+    """A lazy function declared in 'beat_schedule' and called before sending to worker.
 
     Example:
 
@@ -293,7 +293,7 @@ class Scheduler:
         return entry.is_due()
 
     def _when(self, entry, next_time_to_run, mktime=timegm):
-        """Return a utc timestamp, make sure heapq in currect order."""
+        """Return a utc timestamp, make sure heapq in correct order."""
         adjust = self.adjust
 
         as_now = maybe_make_aware(entry.default_now())
